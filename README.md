@@ -1,6 +1,5 @@
 # Difficulty-Aware-Reinforcement-Learning-for-Adaptive-Reasoning-Budget-Allocation-in-LLMs
 
-# Difficulty-Aware Reinforcement Learning for Adaptive Reasoning Budget Allocation in LLMs
 
 A lightweight policy network trained with PPO and DPO that dynamically allocates thinking token budgets to a frozen large language model on a per-question basis, achieving better accuracy at lower inference cost than fixed budget strategies.
 
@@ -348,6 +347,4 @@ Schulman et al. (2017). Proximal policy optimization algorithms. arXiv:1707.0634
 
 ---
 
-## AI Disclosure
 
-Experimental design, model implementation, training, results, and analysis are entirely original work. Claude (Anthropic) assisted with code debugging and documentation writing. All scientific content and conclusions are the author's own.
