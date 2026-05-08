@@ -327,14 +327,3 @@ ds = load_dataset("gsm8k", "main")
 
 ---
 
-## 🤖 AI Disclosure
-
-Claude (Anthropic) was used to assist with report writing and formatting. All experimental design, model implementation, training, results, and analysis are original work by the author.
-
----
-
-<div align="center">
-
-*University of Illinois Urbana-Champaign · IS 597 LLM · Spring 2026*
-
-</div>
