@@ -1,350 +1,170 @@
 # Difficulty-Aware-Reinforcement-Learning-for-Adaptive-Reasoning-Budget-Allocation-in-LLMs
 
-
-A lightweight policy network trained with PPO and DPO that dynamically allocates thinking token budgets to a frozen large language model on a per-question basis, achieving better accuracy at lower inference cost than fixed budget strategies.
-
----
-
-## Overview
-
-Standard LLM inference assigns the same reasoning token budget to every input regardless of difficulty. A simple arithmetic problem gets the same compute as a five-step word problem. This wastes tokens on easy questions and can be insufficient for hard ones.
-
-This project trains a small MLP policy network to predict the optimal thinking token budget for each question before the LLM generates any reasoning. The frozen LLM then reasons within that budget and extracts a final answer. The result is a variable budget policy that beats fixed budget baselines on the accuracy vs tokens Pareto frontier.
-
-**Best result:** 80% accuracy at 185 average tokens, beating fixed budget 224 tokens (79% accuracy) while saving 39 tokens per question. At 1 crore questions this saves 39 crore tokens with better accuracy.
-
----
-
-## Key Results
-
-| Method | Accuracy | Avg Tokens | vs Nearest Fixed Baseline |
-|---|---|---|---|
-| Fixed 96 tokens | 47% | 96 | baseline |
-| Fixed 128 tokens | 63% | 128 | baseline |
-| Fixed 160 tokens | 75% | 160 | baseline |
-| Fixed 192 tokens | 76% | 192 | baseline |
-| Fixed 224 tokens | 79% | 224 | baseline |
-| Fixed 256 tokens | 83% | 256 | baseline |
-| Policy Model 4 (1.5B) | 33% | 116 | matches fixed 128 using 12 fewer tokens |
-| Policy Model 9 (1.5B) | 34% | 167 | beats fixed 168 by +4% at same token cost |
-| **Policy Model 10 (7B)** | **80%** | **185** | **beats fixed 224 by +1% saving 39 tokens** |
-
----
-
-## System Architecture
-
-```
-Question
-   |
-   v
-QuestionFeaturizer (446-dim vector)
-   |-- SentenceTransformer all-MiniLM-L6-v2 (384-dim SBERT embedding)
-   |-- 62 handcrafted difficulty features
-         |-- operation count (add, multiply, divide, percent keywords)
-         |-- number count in question
-         |-- sentence count (proxy for reasoning steps)
-         |-- multi-step indicators (first, then, next, finally)
-         |-- conditional logic flags (if, when, unless)
-         |-- unit conversion flags (hours, minutes, kilometers)
-         |-- composite difficulty score (weighted combination)
-   |
-   v
-ContinuousBudgetPolicy (2-layer MLP, 256 hidden units)
-   |-- outputs Normal distribution over normalized budget
-   |-- deterministic mode: sigmoid(mean) -> budget
-   |-- stochastic mode: sample -> budget (used during PPO rollout)
-   |
-   v
-Budget B (integer in [96, 256] tokens)
-   |
-   v
-Stage 1: LLM generates thinking text up to B tokens
-   |
-   v
-Stage 2: LLM reads thinking text and extracts final numeric answer
-   |
-   v
-Reward = correct + 0.25 * correct - 0.0005 * thinking_tokens
-```
-
----
-
-## GPU and CUDA Optimization
-
-### Hardware
-
-- GPU: NVIDIA H200 NVL with 150 GB VRAM
-- CUDA version: 12.8
-- PyTorch: 2.10 and 2.11 with cu128 wheels
-- Framework: HuggingFace Transformers with device_map="auto"
-
-### Batched GPU Inference
-
-The most significant optimization is the batched LLM inference pipeline. Instead of processing questions one at a time (which would require a separate CUDA kernel launch per question), all questions sharing the same thinking budget are grouped and processed in a single batched forward pass.
-
-```python
-def generate_batch(self, prompts, max_new_tokens):
-    # Left-pad all prompts to same length for batched decoding
-    # Single CUDA kernel launch for entire batch
-    # Reduces CPU-GPU synchronization overhead by batch_size factor
-    inputs = self.tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        truncation=True
-    ).to(self.device)
-
-    with torch.no_grad():
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-    return outputs
-```
-
-**Why left-padding for batched decoder inference:** Decoder-only models (Qwen, GPT family) attend to all previous tokens autoregressively. Right-padding places padding tokens before the actual content, causing the model to attend to meaningless padding during generation. Left-padding ensures all real tokens appear at the end of the sequence so the model's attention is correctly grounded.
-
-**Speedup achieved:** Batched inference with batch_size=16 achieves approximately 3x to 4x wall-clock speedup over sequential single-question inference. For the oracle label construction phase which evaluates 300 questions across 7 budget values, this reduces runtime from approximately 14 hours to under 4 hours.
-
-### GPU Memory Management
-
-The 7B model (Qwen2.5-7B-Instruct) uses approximately 15 GB of VRAM in float16 precision. With 150 GB available on H200, batch size is set to 8 for the 7B model leaving ample headroom for the KV cache during generation.
-
-```python
-llm = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    dtype=torch.float16,      # FP16 halves memory vs FP32
-    device_map="auto",        # automatic GPU placement
-    trust_remote_code=True
-)
-```
-
-For the 1.5B model, batch size is increased to 16 as the model occupies only approximately 3 GB of VRAM.
-
-### Parallel Oracle Construction
-
-The oracle label building phase evaluates every training question at multiple budget values. Each budget level is processed as a single batched GPU call rather than nested loops:
-
-```python
-# Process all 300 questions at budget=128 in one batched call
-# Then all 300 at budget=160 in one batched call
-# etc.
-# Total GPU calls = num_budgets (7), not num_questions * num_budgets (2100)
-for budget in oracle_budgets:
-    results = run_batch_two_stage(questions, answers, budget, llm, cfg)
-```
-
-This reduces total GPU kernel launches from 2,100 to 7 for the oracle construction phase.
-
-### Caching Layer
-
-All LLM calls are cached to disk using MD5-keyed JSON files. The cache key is a hash of the question text, budget value, and model name. On subsequent runs, cached results are loaded directly without any GPU computation, enabling fast iteration during hyperparameter tuning.
-
-```python
-def make_cache_key(stage, question, context, model_name):
-    content = f"{stage}|{question}|{context}|{model_name}"
-    return hashlib.md5(content.encode()).hexdigest()
-```
-
----
-
-## Training Pipeline
-
-### Phase 1: Oracle Label Construction
-
-For each training question, the LLM is evaluated at multiple fixed budgets (96, 128, 160, 192, 224, 256 tokens). The oracle label is the minimum budget at which the model answers correctly. This teaches the policy what the ideal efficient budget looks like for each question.
-
-### Phase 2: Supervised Warmstart
-
-The policy is pre-trained via supervised regression on oracle labels before any RL begins. This gives the policy a meaningful starting point rather than random initialization, which would waste early RL epochs on random exploration from a cold start.
-
-Loss: mean squared error between predicted normalized budget and oracle normalized budget.
-
-### Phase 3: PPO Fine-tuning
-
-Proximal Policy Optimization fine-tunes the policy using rollout experiences collected on training questions. Key PPO implementation details:
-
-```
-ppo_epochs = 2         # update passes per rollout batch (reduced from 4 to prevent over-updating)
-ppo_epsilon = 0.2      # clip range: ratio stays in [0.8, 1.2]
-ppo_batch_size = 32    # mini-batch size for PPO gradient updates
-grad_clip_norm = 0.5   # gradient clipping to prevent NaN from high-variance rollouts
-```
-
-**Value network pre-training:** Before PPO begins, the value network is pre-trained for 5 epochs on oracle reward estimates. Without this, ValueLoss starts at 2.6 (random initialization), producing garbage advantage estimates in PPO epoch 1. Pre-training brings ValueLoss below 0.5 before the first policy update.
-
-**Advantage estimation:**
-```
-Advantage = Reward - Value(question_features)
-Normalized advantage = (advantage - mean) / (std + 1e-8)
-```
-
-### Reward Function
-
-```
-reward = correct + 0.25 * correct - 0.0005 * thinking_tokens
-```
-
-At 185 tokens correct: 1.25 - 0.0925 = 1.1575
-At 256 tokens correct: 1.25 - 0.128 = 1.122
-
-The small gap encourages efficiency without punishing longer budgets when they are genuinely needed.
-
----
-
-## Policy Network Architecture
-
-```python
-class ContinuousBudgetPolicy(nn.Module):
-    def __init__(self, input_dim=446, hidden_dim=256):
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.mean_head = nn.Linear(hidden_dim, 1)
-        self.log_std_head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x):
-        h = self.net(x)
-        mean = self.mean_head(h)
-        log_std = self.log_std_head(h).clamp(-2, 2)
-        # NaN guard: replace any exploded weights with safe values
-        mean = torch.nan_to_num(mean, nan=0.0)
-        log_std = torch.nan_to_num(log_std, nan=-0.5)
-        return mean, log_std
-
-    def sample_budget(self, features):
-        mean, log_std = self.forward(features)
-        dist = Normal(mean, torch.exp(log_std))
-        action = dist.rsample()           # reparameterization trick for gradient flow
-        log_prob = dist.log_prob(action)
-        norm_budget = torch.sigmoid(action)
-        return norm_budget, log_prob, dist.entropy()
-```
-
-Budget denormalization:
-```
-budget = norm_budget * (max_budget - min_budget) + min_budget
-budget = clamp(round(budget), min_budget, max_budget)
-```
-
----
-
-## Difficulty Features
-
-The featurizer adds 62 handcrafted features on top of the 384-dim SBERT embedding:
-
-**Original 50 features (keyword presence flags):**
-Boolean indicators for math-related words: total, remaining, difference, product, average, fraction, ratio, percent, and 42 others.
-
-**New 12 difficulty detection features:**
-
-| Feature | Description |
-|---|---|
-| op_count | Count of arithmetic operation keywords |
-| num_count | Count of numerical values in question |
-| has_large_num | Flag for numbers greater than 100 |
-| sentence_count | Number of sentences (proxy for reasoning steps) |
-| multistep_count | Count of sequencing words: first, then, next, finally |
-| has_conditional | Flag for if, when, unless |
-| has_comparison | Flag for more than, less than, at least, how many more |
-| has_unit_conversion | Flag for time, distance, weight units |
-| has_pct_fraction | Flag for percent, half, third, quarter |
-| entity_count | Count of pronouns and named entities |
-| has_multiple_q | Flag for multiple question marks or "and how" |
-| raw_difficulty | Weighted composite: 0.35 * op + 0.25 * num + 0.20 * sentences + 0.20 * multistep |
-
----
-
-## Model Iteration History
-
-| Model | LLM | Algorithm | Accuracy | Avg Tokens | Key Lesson |
-|---|---|---|---|---|---|
-| M1 | 1.5B | REINFORCE | 15% test | 142 | Too little data (80q), noisy reward, collapsed to one budget |
-| M2 | 1.5B | Actor-Critic | 30% test | 142 | Value network doubled accuracy but still collapsed to one budget |
-| M3 | 1.5B | Warmstart + Actor-Critic | 30% test | 103 | First real per-question adaptation, spread 85-139 tokens |
-| M4 | 1.5B | Warmstart + PPO binary reward | 33% test | 116 | Matches fixed 128 using 12 fewer tokens |
-| M5 to M9 | 1.5B | PPO variants | 39% best | 182 | Fixed oracle cache bug, value pretrain, ppo_epochs 4 to 2 |
-| M10 | 7B | PPO + rich features | 80% test | 185 | Beats fixed 224 by +1% saving 39 tokens per question |
-| M11 | 7B | PPO + forced exploration | NaN | n/a | Forced 20%+20% extreme budgets caused gradient NaN explosion |
-| M12 | 7B | DPO | 67% test | 142 | Only 74 valid pairs from 300 questions, policy collapsed to min budget |
-
----
-
-## Installation
-
-```bash
-# Install PyTorch with CUDA 12.8
-pip install torch --index-url https://download.pytorch.org/whl/cu128
+Large language models typically use the same reasoning budget for every question, regardless of difficulty. Easy questions waste tokens; hard questions may not get enough. This project trains a lightweight budget policy network that predicts the number of reasoning tokens a frozen LLM should use per question, before reasoning begins.
+The system uses a two-stage inference pipeline:
+
+The frozen LLM generates a reasoning chain under the predicted token budget
+The same LLM reads the reasoning and produces a final numeric answer
+
+A small trainable MLP (the policy network) decides the budget B for each question based on its features. Only the policy network is trained. The LLM remains completely frozen throughout.
+The approach is evaluated on GSM8K across 10 model configurations spanning two LLM scales (1.5B and 7B), three training algorithms (REINFORCE, PPO, DPO), and progressively richer question features.
+Best result: 80% accuracy at 185 avg tokens (Model 9, PPO + Qwen2.5-7B), outperforming the fixed 192-token baseline of 76% while using fewer tokens.
+
+Repository Structure
+.
+├── model1_reinforce.py          # M1: REINFORCE, 1.5B, 80 train / 20 test
+├── model2_actor_critic.py       # M2: Actor-Critic + soft reward, 200/50
+├── model3_warmstart_a2c.py      # M3: Warm-start + A2C, 300/100
+├── model4_hard_reward.py        # M4: Hard reward + exploration floor
+├── model5_oracle_blend.py       # M5: Oracle blend + entropy fix
+├── model6_ppo_highest.py        # M6: PPO + highest reward oracle
+├── model7_ppo_mincorrect.py     # M7: PPO + minimum correct oracle
+├── model8_rich_features.py      # M8: PPO + 446-dim features, 1.5B
+├── model9_ppo_7b.py             # M9: PPO + Qwen2.5-7B (best model)
+├── model10_dpo.py               # M10: DPO + 7B (ablation)
+├── requirements.txt
+└── README.md
+
+Model Progression
+ModelLLMAlgorithmAccuracyAvg TokensM11.5BREINFORCE15%142M21.5BActor-Critic + soft reward30%142M31.5BWarm-start + A2C30%103M41.5BWarm-start + hard reward33%116M51.5BActor-Critic + oracle blend32%130M61.5BPPO + highest reward oracle39%182M71.5BPPO + min correct oracle34%167M81.5BPPO + 446-dim features49%223M97BPPO (best)80%185M107BDPO (ablation)67%142
+
+Method
+Two-Stage Inference Pipeline
+Question → Policy Network → Budget B → LLM Reasoning (B tokens) → LLM Answer Extraction → Final Answer
+Policy Network
+
+Two-layer MLP with 256 hidden units per layer
+~170,000 trainable parameters
+Input: 446-dimensional question feature vector
+Output: Gaussian distribution over normalized budget → sampled during training, mean at inference
+Budget clamped to [96, 256] tokens
+
+Question Feature Vector (446 dimensions)
+ComponentDimensionsDescriptionSBERT Embedding384all-MiniLM-L6-v2 sentence embeddingOriginal handcrafted50Token count, digit count, keyword flagsDifficulty features (M8+)12Operation count, large number flag, conditional logic, unit conversion, composite scoreTotal446
+Reward Function
+R(b) = 𝟙[â = a*] + 0.25 · 𝟙[â = a*] − 0.0005 · b
+Correct answers earn 1.25 minus a small token penalty. Wrong answers earn only the negative token penalty.
+Oracle Label Construction
+For each training question, the LLM is run at every candidate budget in {128, 144, 160, 176, 192, 210, 220}. The oracle label is the minimum budget that produces a correct answer. If no budget is correct, the highest-reward budget is used.
+Training Pipeline (Model 9)
+
+Oracle construction: Run frozen 7B LLM at all candidate budgets on 300 training questions (batched GPU inference, 8 questions at a time)
+Warm-start (10 epochs): Supervised MSE regression on oracle labels with reward-weighted and deviation-weighted loss
+Value network pre-training (5 epochs): Pre-train value network on oracle rewards before PPO begins
+PPO training (10 epochs):
+
+Rollout: sample budgets from policy, run LLM, compute rewards and advantages
+PPO clip update: ratio clamped to [0.8, 1.2]
+Oracle blend loss: supervised MSE on deterministic head alongside PPO loss
+Entropy bonus: entropy coefficient 0.02 to prevent budget collapse
+
+
+Inference: deterministic budget from policy mean → clamp → LLM → answer
+
+
+Key Design Decisions
+What Fixed the Budget Collapse (M1-M5)
+
+M1-M2: Budget collapsed to a single constant value because REINFORCE/Actor-Critic gradients are too noisy
+M3: Oracle warm-start introduced — gives policy a strong starting point
+M4: Hard binary reward replaces soft partial credit — cleaner gradient signal
+M5: Entropy coefficient raised 0.002 → 0.02, oracle blend loss added
+M6+: PPO clip ratio [0.8, 1.2] prevents oscillation entirely
+
+Why DPO Failed (M10)
+
+Only 74/300 questions form valid preference pairs (7B solves 94.7% of questions at every budget, so most have no rejected budget)
+No per-step reward signal → budget collapses from 142 tokens to 106 tokens across 20 epochs
+PPO receives reward signal on every question every rollout → naturally prevents collapse
+
+Why M9 Works
+All five fixes active simultaneously:
+
+PPO clipped surrogate objective (Schulman et al., 2017)
+Value network pre-training before PPO begins
+Oracle warm-start with minimum correct budget labels
+446-dimensional difficulty-aware feature vector
+Oracle blend loss keeps deterministic head learning during PPO
+
+
+Results: Model 9 vs Fixed Budgets
+MethodAvg TokensAccuracyFixed 969647%Fixed 12812863%Fixed 16016074%Fixed 19219276%Fixed 22422479%Fixed 25625684%Policy M9 (PPO)18580%
+The policy beats fixed 192-token baseline (76%) while using fewer tokens, and matches fixed 224-token accuracy (79%) using 39 fewer tokens per question.
+
+Installation
+bash# Clone the repository
+git clone https://github.com/YOUR_USERNAME/adaptive-reasoning-budget.git
+cd adaptive-reasoning-budget
 
 # Install dependencies
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install numpy transformers datasets sentence-transformers accelerate
+Requirements
+torch>=2.11.0+cu128
+transformers>=4.40.0
+datasets>=2.18.0
+sentence-transformers>=2.7.0
+accelerate>=0.30.0
+numpy>=1.26.0
 
-# Verify GPU
-python -c "import torch; print(torch.cuda.get_device_name(0))"
-```
+Running the Models
+Run Model 9 (Best Model)
+bashpython model9_ppo_7b.py
+This will:
 
----
+Load GSM8K (300 train, 100 test questions)
+Build oracle labels (cached after first run)
+Run warm-start for 10 epochs
+Pre-train value network for 5 epochs
+Run PPO for 10 epochs
+Evaluate final policy against fixed budget baselines
+Print final results table
 
-## Configuration
+Run Any Other Model
+bashpython model1_reinforce.py
+python model2_actor_critic.py
+# ... etc
+Cache Behavior
+Each model caches LLM inference results to disk to avoid redundant GPU calls. Cache is stored in ./cache_ppo_vXX/ and oracle labels in oracle_labels_vXX.json. To clear cache and rerun from scratch, set clear_cache_on_start: bool = True in the Config dataclass (default is True).
 
-Key config values in the Config dataclass:
+Hardware Requirements
+ComponentMinimumUsed in This WorkGPU24GB VRAM (for 1.5B)NVIDIA H200 NVL 150GBGPU80GB VRAM (for 7B)NVIDIA H200 NVL 150GBCUDA11.8+12.8RAM32GB—
 
-```python
-llm_name = "Qwen/Qwen2.5-7B-Instruct"
-embed_name = "sentence-transformers/all-MiniLM-L6-v2"
-llm_batch_size = 8            # 8 for 7B model, 16 for 1.5B model
-train_subset = 300
-test_subset = 100
-min_budget = 96
-max_budget = 256
-oracle_budgets = (96, 128, 160, 192, 224, 256)
-warmstart_epochs = 10
-rl_epochs = 10
-ppo_epochs = 2
-ppo_epsilon = 0.2
-dpo_epochs = 20
-dpo_beta = 0.1
-reward_token_penalty = 0.0005
-```
-
----
-
-## Open Challenges
-
-**Budget std collapse:** Across all models the policy budget std stays at 3 to 10, meaning the policy outputs nearly the same budget for every question. True per-question adaptivity needs std of 25 to 35. The policy effectively learns a better fixed budget rather than a genuinely variable one.
-
-**Oracle skew:** 65 to 72% of oracle labels collapse to the minimum budget because the 7B model is too accurate at short budgets. This gives the warmstart too little signal about hard questions.
-
-**Training set size:** 300 questions produces noisy PPO gradient estimates. Full GSM8K training set has 7,473 questions.
-
----
-
-## Next Steps
-
-- Scale to full GSM8K training set (7,473 questions)
-- Use LLM to self-score question difficulty by comparing correctness at 96 vs 256 tokens
-- Curriculum RL: train on hard questions first then gradually add easy ones
-- Discrete policy head with 6 budget classes instead of continuous regression
-- Larger model experiments: Qwen2.5-14B
-
----
-
-## References
-
-Cobbe et al. (2021). Training verifiers to solve math word problems. arXiv:2110.14168.
-
-Aggarwal and Welleck (2025). L1: Controlling how long a reasoning model thinks with reinforcement learning. arXiv:2503.04697.
-
-DeepSeek-AI (2025). DeepSeek-R1: Incentivizing reasoning capability in LLMs via reinforcement learning. arXiv:2501.12948.
-
-Schulman et al. (2017). Proximal policy optimization algorithms. arXiv:1707.06347.
-
----
+Note: The 7B model (Models 9, 10) requires at least 40-80GB VRAM in FP16. The 1.5B model (Models 1-8) runs on smaller GPUs with ~8GB VRAM.
 
 
+Configuration
+All hyperparameters are controlled via a Config dataclass at the top of each script. Key parameters for Model 9:
+python@dataclass
+class Config:
+    llm_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    embed_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    llm_batch_size: int = 8
+    oracle_budgets: Tuple[int, ...] = (128, 144, 160, 176, 192, 210, 220)
+    warmstart_epochs: int = 10
+    rl_epochs: int = 10
+    ppo_epochs: int = 2
+    ppo_epsilon: float = 0.2
+    policy_learning_rate: float = 3e-4
+    value_learning_rate: float = 8e-4
+    entropy_coef: float = 0.02
+    reward_token_penalty: float = 0.0005
+    exact_match_bonus: float = 0.25
+    min_budget: int = 96
+    max_budget: int = 256
+    train_subset: int = 300
+    test_subset: int = 100
+
+Dataset
+GSM8K (Grade School Math 8K) — Cobbe et al., 2021
+
+7,473 training questions, 1,319 test questions
+Grade-school arithmetic word problems
+Loaded via Hugging Face datasets library
+First N questions used in order (not random sampling) to ensure reproducibility
+
+pythonfrom datasets import load_dataset
+ds = load_dataset("gsm8k", "main")
+
+
+}
